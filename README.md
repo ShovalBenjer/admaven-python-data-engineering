@@ -45,6 +45,10 @@ A robust, concurrent scraper utilizing a **Map-Reduce** architecture.
 ---
 
 # **2. System Architecture**
+<p align="center">
+  <img width="1024" height="565" alt="image" src="https://github.com/user-attachments/assets/07a2b2eb-d257-420d-ac17-4fe1bb065575" />
+</p>
+
 
 ## **Python Pipeline: Map-Reduce Intelligence**
 
