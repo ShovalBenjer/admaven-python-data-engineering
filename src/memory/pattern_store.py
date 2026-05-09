@@ -3,6 +3,7 @@ import json
 import logging
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import List, Optional, Dict, Any
 
 import psycopg2
@@ -14,12 +15,26 @@ from .embeddings import EmbeddingGenerator
 
 logger = logging.getLogger(__name__)
 
-CREATE_TABLE_SQL = """
+_MIGRATION_PATH = Path(__file__).parent / "migrations" / "001_create_fraud_patterns_table.sql"
+
+
+def _load_create_table_sql() -> str:
+    try:
+        sql = _MIGRATION_PATH.read_text()
+        sql = sql.replace("BEGIN;", "").replace("COMMIT;", "")
+        return sql.strip()
+    except FileNotFoundError:
+        logger.warning("Migration file not found at %s, using fallback schema", _MIGRATION_PATH)
+        return _FALLBACK_SQL
+
+
+_FALLBACK_SQL = """
 CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TABLE IF NOT EXISTS fraud_patterns (
     id SERIAL PRIMARY KEY,
     pattern_embedding vector(1536),
+    embedding_provider VARCHAR(32),
     advertiser_id VARCHAR(64),
     campaign_id VARCHAR(64),
     fraud_type VARCHAR(128),
@@ -36,7 +51,10 @@ CREATE INDEX IF NOT EXISTS idx_fraud_patterns_embedding ON fraud_patterns
 CREATE INDEX IF NOT EXISTS idx_fraud_patterns_advertiser ON fraud_patterns (advertiser_id);
 CREATE INDEX IF NOT EXISTS idx_fraud_patterns_fraud_type ON fraud_patterns (fraud_type);
 CREATE INDEX IF NOT EXISTS idx_fraud_patterns_last_seen ON fraud_patterns (last_seen);
+CREATE INDEX IF NOT EXISTS idx_fraud_patterns_provider ON fraud_patterns (embedding_provider);
 """
+
+CREATE_TABLE_SQL = _load_create_table_sql()
 
 
 @dataclass
@@ -48,6 +66,7 @@ class FraudPattern:
     pattern_description: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
     pattern_embedding: Optional[List[float]] = None
+    embedding_provider: Optional[str] = None
     id: Optional[int] = None
     created_at: Optional[str] = None
     last_seen: Optional[str] = None
@@ -64,11 +83,22 @@ class PatternStore:
         dsn: Optional[str] = None,
         embedding_generator: Optional[EmbeddingGenerator] = None,
     ):
-        self.dsn = dsn or os.getenv(
-            "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/admaven"
-        )
+        self.dsn = dsn or os.getenv("DATABASE_URL")
+        if not self.dsn:
+            raise ValueError(
+                "DATABASE_URL environment variable is required. "
+                "Set it to your PostgreSQL connection string."
+            )
         self._conn = None
         self._embedding_gen = embedding_generator or EmbeddingGenerator()
+
+    def __enter__(self):
+        self.connect()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
 
     def connect(self) -> None:
         self._conn = psycopg2.connect(self.dsn)
@@ -92,25 +122,31 @@ class PatternStore:
         if not self._conn or self._conn.closed:
             self.connect()
 
+    def _get_embedding(self, text: str) -> tuple:
+        embedding, provider = self._embedding_gen.generate_with_provider(text)
+        return embedding, provider
+
     def store_pattern(self, pattern: FraudPattern) -> int:
         self._ensure_connected()
         if pattern.pattern_embedding is None:
-            pattern.pattern_embedding = self._embedding_gen.generate(
+            text = (
                 pattern.pattern_description
                 or f"{pattern.fraud_type} advertiser={pattern.advertiser_id} campaign={pattern.campaign_id}"
             )
+            pattern.pattern_embedding, pattern.embedding_provider = self._get_embedding(text)
 
         with self._conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO fraud_patterns
-                    (pattern_embedding, advertiser_id, campaign_id, fraud_type,
+                    (pattern_embedding, embedding_provider, advertiser_id, campaign_id, fraud_type,
                      confidence_score, pattern_description, metadata)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """,
                 (
                     np.array(pattern.pattern_embedding),
+                    pattern.embedding_provider,
                     pattern.advertiser_id,
                     pattern.campaign_id,
                     pattern.fraud_type,
@@ -121,10 +157,11 @@ class PatternStore:
             )
             row_id = cur.fetchone()[0]
         logger.info(
-            "Stored fraud pattern id=%s fraud_type=%s advertiser=%s",
+            "Stored fraud pattern id=%s fraud_type=%s advertiser=%s provider=%s",
             row_id,
             pattern.fraud_type,
             pattern.advertiser_id,
+            pattern.embedding_provider,
         )
         return row_id
 
@@ -133,13 +170,15 @@ class PatternStore:
         rows = []
         for p in patterns:
             if p.pattern_embedding is None:
-                p.pattern_embedding = self._embedding_gen.generate(
+                text = (
                     p.pattern_description
                     or f"{p.fraud_type} advertiser={p.advertiser_id} campaign={p.campaign_id}"
                 )
+                p.pattern_embedding, p.embedding_provider = self._get_embedding(text)
             rows.append(
                 (
                     np.array(p.pattern_embedding),
+                    p.embedding_provider,
                     p.advertiser_id,
                     p.campaign_id,
                     p.fraud_type,
@@ -154,7 +193,7 @@ class PatternStore:
                 cur,
                 """
                 INSERT INTO fraud_patterns
-                    (pattern_embedding, advertiser_id, campaign_id, fraud_type,
+                    (pattern_embedding, embedding_provider, advertiser_id, campaign_id, fraud_type,
                      confidence_score, pattern_description, metadata)
                 VALUES %s
                 RETURNING id
@@ -173,12 +212,19 @@ class PatternStore:
         min_similarity: float = 0.7,
         fraud_type: Optional[str] = None,
         advertiser_id: Optional[str] = None,
+        embedding_provider: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         self._ensure_connected()
         query_vec = np.array(query_embedding)
 
-        conditions = ["1 - (pattern_embedding <=> %s) >= %s"]
-        params: list = [query_vec, min_similarity]
+        if embedding_provider is None:
+            embedding_provider = self._embedding_gen.provider_name
+
+        conditions = [
+            "1 - (pattern_embedding <=> %s) >= %s",
+            "embedding_provider = %s",
+        ]
+        params: List[Any] = [query_vec, min_similarity, embedding_provider]
 
         if fraud_type:
             conditions.append("fraud_type = %s")
@@ -188,7 +234,7 @@ class PatternStore:
             params.append(advertiser_id)
 
         where_clause = " AND ".join(conditions)
-        params.append(k)
+        params.extend([query_vec, query_vec, k])
 
         sql = f"""
             SELECT
@@ -219,7 +265,8 @@ class PatternStore:
             results.append(r)
 
         logger.info(
-            "Found %d similar patterns (k=%d, min_sim=%.2f)", len(results), k, min_similarity
+            "Found %d similar patterns (k=%d, min_sim=%.2f, provider=%s)",
+            len(results), k, min_similarity, embedding_provider,
         )
         return results
 
@@ -230,11 +277,13 @@ class PatternStore:
         min_similarity: float = 0.7,
         fraud_type: Optional[str] = None,
         advertiser_id: Optional[str] = None,
+        embedding_provider: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         query_embedding = self._embedding_gen.generate(description)
         return self.find_similar_patterns(
             query_embedding, k=k, min_similarity=min_similarity,
             fraud_type=fraud_type, advertiser_id=advertiser_id,
+            embedding_provider=embedding_provider,
         )
 
     def update_last_seen(self, pattern_id: int) -> None:

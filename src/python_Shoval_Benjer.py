@@ -141,6 +141,16 @@ def worker_entry(comp: str, dom: str, clients: Set[str]) -> List[EnrichedSite]:
 
 
 MEMORY_ENABLED = os.getenv("AGENTOPS_MEMORY_ENABLED", "false").lower() == "true"
+_memory_store = None
+
+
+def _get_memory_store():
+    global _memory_store
+    if _memory_store is None:
+        _memory_store = PatternStore()
+        _memory_store.connect()
+        _memory_store.initialize_schema()
+    return _memory_store
 
 
 def retrieve_similar_fraud_patterns(
@@ -152,13 +162,10 @@ def retrieve_similar_fraud_patterns(
     if not MEMORY_ENABLED:
         return []
     try:
-        store = PatternStore()
-        store.connect()
-        store.initialize_schema()
+        store = _get_memory_store()
         results = store.find_similar_by_description(
             description, k=k, fraud_type=fraud_type, advertiser_id=advertiser_id,
         )
-        store.close()
         return results
     except Exception as e:
         logger.bind(process="Memory").warning(f"Pattern retrieval failed: {e}")
@@ -169,9 +176,7 @@ def store_fraud_patterns_from_results(results: List[EnrichedSite]) -> None:
     if not MEMORY_ENABLED:
         return
     try:
-        store = PatternStore()
-        store.connect()
-        store.initialize_schema()
+        store = _get_memory_store()
         patterns = []
         for r in results:
             if r.got_blocked and not r.already_working:
@@ -196,7 +201,6 @@ def store_fraud_patterns_from_results(results: List[EnrichedSite]) -> None:
             store.store_patterns(patterns)
             log = logger.bind(process="Memory")
             log.info(f"Stored {len(patterns)} fraud patterns from scan results")
-        store.close()
     except Exception as e:
         logger.bind(process="Memory").warning(f"Pattern storage failed: {e}")
 
@@ -213,14 +217,18 @@ def main():
         tasks = list(zip(comp_df["competitor"], comp_df["run_time_domain"]))
     except Exception as e: return log.critical(f"Setup Failed: {e}")
     if MEMORY_ENABLED:
-        for comp, domain in tasks:
-            similar = retrieve_similar_fraud_patterns(
-                f"competitor {comp} domain {domain}",
-                advertiser_id=comp,
-                k=3,
-            )
-            if similar:
-                log.info(f"Found {len(similar)} historical patterns for {comp}: {[s['fraud_type'] for s in similar]}")
+        try:
+            store = _get_memory_store()
+            for comp, domain in tasks:
+                similar = store.find_similar_by_description(
+                    f"competitor {comp} domain {domain}",
+                    advertiser_id=comp,
+                    k=3,
+                )
+                if similar:
+                    log.info(f"Found {len(similar)} historical patterns for {comp}: {[s['fraud_type'] for s in similar]}")
+        except Exception as e:
+            log.warning(f"Memory lookup failed: {e}")
     all_res = []
     with ProcessPoolExecutor(max_workers=os.cpu_count() or 4) as exc:
         futures = {exc.submit(worker_entry, c, d, clients): c for c, d in tasks}

@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch, MagicMock
 import numpy as np
-from memory.embeddings import EmbeddingGenerator, TARGET_DIMENSION
+from memory.embeddings import EmbeddingGenerator, TARGET_DIMENSION, PROVIDER_ZAI, PROVIDER_ST
 from memory.pattern_store import FraudPattern, PatternStore, CREATE_TABLE_SQL
 
 
@@ -35,13 +35,12 @@ class TestEmbeddingGenerator(unittest.TestCase):
         mock_post.assert_called_once()
 
     @patch("memory.embeddings._requests.post")
-    def test_zai_failure_falls_back_to_st(self, mock_post):
+    def test_zai_failure_raises_error(self, mock_post):
         mock_post.side_effect = Exception("API down")
         gen = EmbeddingGenerator(api_key="test-key")
-        with patch.object(gen, "_generate_st", return_value=[0.0] * TARGET_DIMENSION) as mock_st:
-            result = gen.generate("test pattern")
-            mock_st.assert_called_once()
-            self.assertEqual(len(result), TARGET_DIMENSION)
+        with self.assertRaises(RuntimeError) as ctx:
+            gen.generate("test pattern")
+        self.assertIn("incompatible embedding spaces", str(ctx.exception))
 
     @patch("memory.embeddings._requests.post")
     def test_batch_embedding(self, mock_post):
@@ -60,6 +59,29 @@ class TestEmbeddingGenerator(unittest.TestCase):
         results = gen.generate_batch(["text1", "text2"])
         self.assertEqual(len(results), 2)
         self.assertEqual(len(results[0]), TARGET_DIMENSION)
+
+    def test_provider_name_st_when_no_key(self):
+        gen = EmbeddingGenerator(api_key=None)
+        self.assertEqual(gen.provider_name, PROVIDER_ST)
+
+    def test_provider_name_zai_when_key_set(self):
+        gen = EmbeddingGenerator(api_key="test-key")
+        self.assertEqual(gen.provider_name, PROVIDER_ZAI)
+
+    @patch("memory.embeddings._requests.post")
+    def test_generate_with_provider_returns_provider(self, mock_post):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "data": [{"embedding": [0.1] * TARGET_DIMENSION, "index": 0}]
+        }
+        mock_resp.raise_for_status = MagicMock()
+        mock_post.return_value = mock_resp
+
+        gen = EmbeddingGenerator(api_key="test-key")
+        embedding, provider = gen.generate_with_provider("test")
+        self.assertEqual(provider, PROVIDER_ZAI)
+        self.assertEqual(len(embedding), TARGET_DIMENSION)
 
 
 class TestFraudPattern(unittest.TestCase):
@@ -86,10 +108,20 @@ class TestFraudPattern(unittest.TestCase):
         )
         self.assertEqual(p.metadata, {})
 
+    def test_embedding_provider_default_none(self):
+        p = FraudPattern(
+            advertiser_id="A1",
+            campaign_id="C1",
+            fraud_type="fraud",
+            confidence_score=0.5,
+        )
+        self.assertIsNone(p.embedding_provider)
+
 
 class TestPatternStore(unittest.TestCase):
     def test_create_table_sql_contains_required_columns(self):
         self.assertIn("pattern_embedding vector(1536)", CREATE_TABLE_SQL)
+        self.assertIn("embedding_provider", CREATE_TABLE_SQL)
         self.assertIn("advertiser_id", CREATE_TABLE_SQL)
         self.assertIn("campaign_id", CREATE_TABLE_SQL)
         self.assertIn("fraud_type", CREATE_TABLE_SQL)
@@ -101,6 +133,14 @@ class TestPatternStore(unittest.TestCase):
         self.assertIn("idx_fraud_patterns_embedding", CREATE_TABLE_SQL)
         self.assertIn("idx_fraud_patterns_advertiser", CREATE_TABLE_SQL)
         self.assertIn("idx_fraud_patterns_fraud_type", CREATE_TABLE_SQL)
+        self.assertIn("idx_fraud_patterns_provider", CREATE_TABLE_SQL)
+
+    def test_dsn_required_when_no_env(self):
+        with patch.dict("os.environ", {}, clear=True):
+            if "DATABASE_URL" in __import__("os").environ:
+                del __import__("os").environ["DATABASE_URL"]
+            with self.assertRaises(ValueError):
+                PatternStore()
 
     @patch("memory.pattern_store.psycopg2.connect")
     @patch("memory.pattern_store.register_vector")
@@ -111,6 +151,16 @@ class TestPatternStore(unittest.TestCase):
         store.connect()
         mock_connect.assert_called_once_with("postgresql://test:test@localhost/db")
         mock_register.assert_called_once_with(mock_conn)
+
+    @patch("memory.pattern_store.psycopg2.connect")
+    @patch("memory.pattern_store.register_vector")
+    def test_context_manager(self, mock_register, mock_connect):
+        mock_conn = MagicMock()
+        mock_conn.closed = 0
+        mock_connect.return_value = mock_conn
+        with PatternStore(dsn="postgresql://test:test@localhost/db") as store:
+            mock_connect.assert_called_once()
+        mock_conn.close.assert_called_once()
 
     @patch("memory.pattern_store.psycopg2.connect")
     @patch("memory.pattern_store.register_vector")
@@ -144,14 +194,54 @@ class TestPatternStore(unittest.TestCase):
             fraud_type="click_flood",
             confidence_score=0.95,
             pattern_embedding=[0.1] * TARGET_DIMENSION,
+            embedding_provider=PROVIDER_ST,
         )
         row_id = store.store_pattern(pattern)
         self.assertEqual(row_id, 42)
-        mock_cursor.execute.assert_called_once()
+        call_args = mock_cursor.execute.call_args
+        self.assertEqual(len(call_args[0][1]), 8)
+
+    @patch("memory.pattern_store.execute_values")
+    @patch("memory.pattern_store.psycopg2.connect")
+    @patch("memory.pattern_store.register_vector")
+    def test_store_patterns_batch(self, mock_register, mock_connect, mock_ev):
+        mock_conn = MagicMock()
+        mock_conn.closed = 0
+        mock_connect.return_value = mock_conn
+        mock_ev.return_value = [(1,), (2,)]
+
+        store = PatternStore(dsn="postgresql://test:test@localhost/db")
+        store.connect()
+
+        patterns = [
+            FraudPattern(
+                advertiser_id="A1",
+                campaign_id="C1",
+                fraud_type="fraud1",
+                confidence_score=0.8,
+                pattern_embedding=[0.1] * TARGET_DIMENSION,
+                embedding_provider=PROVIDER_ST,
+            ),
+            FraudPattern(
+                advertiser_id="A2",
+                campaign_id="C2",
+                fraud_type="fraud2",
+                confidence_score=0.9,
+                pattern_embedding=[0.2] * TARGET_DIMENSION,
+                embedding_provider=PROVIDER_ST,
+            ),
+        ]
+        ids = store.store_patterns(patterns)
+        self.assertEqual(ids, [1, 2])
+        mock_ev.assert_called_once()
+        rows_arg = mock_ev.call_args[0][2]
+        self.assertEqual(len(rows_arg), 2)
+        self.assertEqual(rows_arg[0][1], PROVIDER_ST)
+        self.assertEqual(rows_arg[1][1], PROVIDER_ST)
 
     @patch("memory.pattern_store.psycopg2.connect")
     @patch("memory.pattern_store.register_vector")
-    def test_find_similar_patterns(self, mock_register, mock_connect):
+    def test_find_similar_patterns_param_count(self, mock_register, mock_connect):
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
         mock_cursor.fetchall.return_value = [
@@ -168,6 +258,95 @@ class TestPatternStore(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["advertiser_id"], "601040")
         self.assertAlmostEqual(results[0]["similarity"], 0.98)
+
+        call_args = mock_cursor.execute.call_args
+        sql = call_args[0][0]
+        params = call_args[0][1]
+        placeholder_count = sql.count("%s")
+        self.assertEqual(
+            placeholder_count, len(params),
+            f"Parameter mismatch: {placeholder_count} placeholders but {len(params)} params"
+        )
+
+    @patch("memory.pattern_store.psycopg2.connect")
+    @patch("memory.pattern_store.register_vector")
+    def test_find_similar_patterns_with_filters_param_count(self, mock_register, mock_connect):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = []
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.closed = 0
+        mock_connect.return_value = mock_conn
+
+        store = PatternStore(dsn="postgresql://test:test@localhost/db")
+        store.connect()
+
+        store.find_similar_patterns(
+            [0.1] * TARGET_DIMENSION, k=5,
+            fraud_type="click_flood", advertiser_id="601040",
+        )
+        call_args = mock_cursor.execute.call_args
+        sql = call_args[0][0]
+        params = call_args[0][1]
+        placeholder_count = sql.count("%s")
+        self.assertEqual(
+            placeholder_count, len(params),
+            f"Parameter mismatch with filters: {placeholder_count} placeholders but {len(params)} params"
+        )
+
+    @patch("memory.pattern_store.psycopg2.connect")
+    @patch("memory.pattern_store.register_vector")
+    def test_find_similar_by_description(self, mock_register, mock_connect):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = [
+            (1, "601040", "653344", "click_flood", 0.95, "desc", "{}", "2025-01-01", "2025-01-02", 0.98)
+        ]
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.closed = 0
+        mock_connect.return_value = mock_conn
+
+        store = PatternStore(dsn="postgresql://test:test@localhost/db")
+        store.connect()
+
+        with patch.object(store._embedding_gen, "generate", return_value=[0.1] * TARGET_DIMENSION):
+            results = store.find_similar_by_description("click fraud", k=3)
+        self.assertEqual(len(results), 1)
+
+    @patch("memory.pattern_store.psycopg2.connect")
+    @patch("memory.pattern_store.register_vector")
+    def test_update_last_seen(self, mock_register, mock_connect):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.closed = 0
+        mock_connect.return_value = mock_conn
+
+        store = PatternStore(dsn="postgresql://test:test@localhost/db")
+        store.connect()
+
+        store.update_last_seen(42)
+        mock_cursor.execute.assert_called_once()
+        self.assertEqual(mock_cursor.execute.call_args[0][1], (42,))
+
+    @patch("memory.pattern_store.psycopg2.connect")
+    @patch("memory.pattern_store.register_vector")
+    def test_get_patterns_by_advertiser(self, mock_register, mock_connect):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = [
+            (1, "601040", "653344", "click_flood", 0.95, "desc", "{}", "2025-01-01", "2025-01-02")
+        ]
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.closed = 0
+        mock_connect.return_value = mock_conn
+
+        store = PatternStore(dsn="postgresql://test:test@localhost/db")
+        store.connect()
+
+        results = store.get_patterns_by_advertiser("601040")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["advertiser_id"], "601040")
 
     @patch("memory.pattern_store.psycopg2.connect")
     @patch("memory.pattern_store.register_vector")
