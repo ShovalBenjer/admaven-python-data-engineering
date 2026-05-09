@@ -6,8 +6,6 @@ Run this separately to start the worker that executes workflows and activities.
 import asyncio
 import os
 import sys
-from datetime import timedelta
-from typing import List
 
 from temporalio.client import Client
 from temporalio.worker import Worker

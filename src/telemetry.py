@@ -15,6 +15,11 @@ from typing import Optional
 _tracer: Optional[trace.Tracer] = None
 _meter: Optional[metrics.Meter] = None
 
+_sites_processed_counter: Optional[metrics.Counter] = None
+_ads_detected_counter: Optional[metrics.Counter] = None
+_anomalies_flagged_counter: Optional[metrics.Counter] = None
+_api_calls_counter: Optional[metrics.Counter] = None
+
 
 def setup_telemetry(
     service_name: str = "fraud-detection",
@@ -74,39 +79,36 @@ def setup_telemetry(
 
 def _create_standard_metrics() -> None:
     """Create standard application metrics."""
+    global _sites_processed_counter, _ads_detected_counter, _anomalies_flagged_counter, _api_calls_counter
+
     if _meter is None:
         return
 
-    # Counter for sites processed
-    _meter.create_counter(
+    _sites_processed_counter = _meter.create_counter(
         name="sites_processed_total",
         description="Total number of sites processed",
         unit="1"
     )
 
-    # Counter for ads detected
-    _meter.create_counter(
+    _ads_detected_counter = _meter.create_counter(
         name="ads_detected_total",
         description="Total number of sites with ads detected",
         unit="1"
     )
 
-    # Counter for anomalies flagged
-    _meter.create_counter(
+    _anomalies_flagged_counter = _meter.create_counter(
         name="anomalies_flagged_total",
         description="Total number of anomalies flagged by Z-score",
         unit="1"
     )
 
-    # Histogram for processing time per site
     _meter.create_histogram(
         name="site_processing_duration_seconds",
         description="Time taken to process a single site",
         unit="s"
     )
 
-    # Counter for API calls
-    _meter.create_counter(
+    _api_calls_counter = _meter.create_counter(
         name="api_calls_total",
         description="Total API calls made to similar sites endpoint",
         unit="1"
@@ -133,19 +135,19 @@ def get_meter() -> metrics.Meter:
 def record_site_processed(success: bool = True, has_ads: bool = False) -> None:
     """Record metrics for a processed site."""
     try:
-        meter = get_meter()
-        meter.create_counter("sites_processed_total").add(1, {"success": str(success)})
-        if has_ads:
-            meter.create_counter("ads_detected_total").add(1)
+        if _sites_processed_counter is not None:
+            _sites_processed_counter.add(1, {"success": str(success)})
+        if has_ads and _ads_detected_counter is not None:
+            _ads_detected_counter.add(1)
     except Exception:
-        pass  # Don't crash on telemetry errors
+        pass
 
 
 def record_anomaly_flagged(status: str) -> None:
     """Record an anomaly being flagged."""
     try:
-        meter = get_meter()
-        meter.create_counter("anomalies_flagged_total").add(1, {"status": status})
+        if _anomalies_flagged_counter is not None:
+            _anomalies_flagged_counter.add(1, {"status": status})
     except Exception:
         pass
 
@@ -153,7 +155,7 @@ def record_anomaly_flagged(status: str) -> None:
 def record_api_call(success: bool = True) -> None:
     """Record an API call."""
     try:
-        meter = get_meter()
-        meter.create_counter("api_calls_total").add(1, {"success": str(success)})
+        if _api_calls_counter is not None:
+            _api_calls_counter.add(1, {"success": str(success)})
     except Exception:
         pass
