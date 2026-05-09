@@ -263,9 +263,11 @@ async def run_zscore_analysis_activity(enriched_sites: List[EnrichedSite]) -> Di
             span.set_attribute("advertiser_anomalies.count", anomalies_df.height)
 
         site_indicators = []
-        if std_visitors and std_visitors > 0:
+        site_mean = ads_df.select(pl.mean("monthly_visitors")).item()
+        site_std = ads_df.select(pl.std("monthly_visitors")).item()
+        if site_std and site_std > 0:
             for row in ads_df.iter_rows(named=True):
-                z = (row["monthly_visitors"] - mean_visitors) / std_visitors
+                z = (row["monthly_visitors"] - site_mean) / site_std
                 if abs(z) > 1.96:
                     site_indicators.append({
                         "site_domain": row["site_domain"],

@@ -19,7 +19,7 @@ DEFAULT_RETRY_POLICY = RetryPolicy(
     initial_interval=timedelta(seconds=2),
     maximum_interval=timedelta(seconds=30),
     maximum_attempts=3,
-    non_retryable_error_types=["temporalio.exceptions.ApplicationError"],
+    non_retryable_error_types=["API_ERROR"],
 )
 
 SOFT_RETRY_POLICY = RetryPolicy(
