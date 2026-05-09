@@ -5,7 +5,7 @@ import re
 import os
 from dataclasses import dataclass, asdict
 from datetime import date
-from typing import List, Dict, Set, Optional
+from typing import List, Dict, Optional
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 from opentelemetry import trace
@@ -15,10 +15,8 @@ import aiohttp
 from huggingface_hub import InferenceClient
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-# Get tracer for this module
 tracer = trace.get_tracer(__name__)
 
-# Reuse constants from original script
 EMAIL_RE = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
 SOCIAL_RE = re.compile(r'(?:https?://)?(?:www\.)?(?:facebook|twitter|linkedin|instagram|youtube|tiktok)\.com/[a-zA-Z0-9_\-\.]+')
 AD_SIGNATURES = {
@@ -30,7 +28,6 @@ AD_SIGNATURES = {
 
 @dataclass
 class EnrichedSite:
-    """Data model representing a processed competitor site."""
     scan_date: str
     site_domain: str
     competitor_name: str
@@ -44,7 +41,6 @@ class EnrichedSite:
 
 
 def heuristic_ad_detect(html: str) -> Dict[str, object]:
-    """Analyzes HTML content using weighted keyword dictionary to detect ad activity."""
     html_lower = html.lower()
     score = sum(AD_SIGNATURES.get(t, 0) for t in AD_SIGNATURES if t in html_lower)
     return {'is_running_ads': score > 2.0, 'ad_evidence': f"Heuristic score: {score:.2f}"}
@@ -52,27 +48,27 @@ def heuristic_ad_detect(html: str) -> Dict[str, object]:
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 async def detect_ads_with_qwen(html: str, hf_token: str) -> Dict[str, object]:
-    """Uses Qwen 2.5-72B via HuggingFace Inference API to semantically analyze HTML for ads."""
     if not hf_token:
         raise ValueError("Missing HF_TOKEN")
     client = InferenceClient(token=hf_token)
     prompt = f"Analyze HTML for ad activity: {html[:2000]}. Output JSON: {{'is_running_ads': true/false, 'ad_evidence': 'reason'}}"
+
     def _call():
         return client.chat_completion(
             model="z-ai/glm-5.1",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=100, temperature=0.1
         )
+
     res = await asyncio.to_thread(_call)
     content = res.choices[0].message.content.strip()
     return json.loads(content[7:-3] if content.startswith('```json') else content)
 
 
 async def fetch_site_data(session: aiohttp.ClientSession, url: str, sem: asyncio.Semaphore) -> str:
-    """Fetches URL content asynchronously with semaphore control."""
     async with sem:
         try:
-            async with session.get(url, timeout=5, headers={'User-Agent': 'Mozilla/5.0'}) as r:
+            async with session.get(url, headers={'User-Agent': 'Mozilla/5.0'}) as r:
                 return await r.text() if r.status not in (403, 404, 500) else ''
         except Exception:
             return ''
@@ -80,17 +76,6 @@ async def fetch_site_data(session: aiohttp.ClientSession, url: str, sem: asyncio
 
 @activity.defn(name="fetch_similar_sites")
 async def fetch_similar_sites_activity(domain: str, api_key: str, competitor_name: str) -> List[Dict]:
-    """
-    Fetches similar sites from the AdMaven API for a given domain.
-
-    Args:
-        domain: The run-time domain to find similar sites for
-        api_key: API key for authentication
-        competitor_name: Name of the competitor (for logging)
-
-    Returns:
-        List of site dictionaries with site_name and monthly_visitors
-    """
     logger.info(f"[{competitor_name}] Fetching similar sites for {domain}")
     with tracer.start_as_current_span("fetch_similar_sites") as span:
         span.set_attribute("competitor", competitor_name)
@@ -126,22 +111,10 @@ async def scrape_and_analyze_site_activity(
     site_info: Dict,
     domain: str,
     competitor_name: str,
-    clients: Set[str],
+    clients: List[str],
     hf_token: str
 ) -> EnrichedSite:
-    """
-    Scrapes a single site and analyzes it for ad activity.
-
-    Args:
-        site_info: Dict with 'site_name' and 'monthly_visitors'
-        domain: The competitor's run-time domain
-        competitor_name: Name of the competitor
-        clients: Set of existing client domains to check against
-        hf_token: HuggingFace token for LLM analysis
-
-    Returns:
-        EnrichedSite with all collected data
-    """
+    clients_set = set(clients)
     with tracer.start_as_current_span("scrape_and_analyze_site") as span:
         span.set_attribute("competitor", competitor_name)
         span.set_attribute("domain", domain)
@@ -171,14 +144,12 @@ async def scrape_and_analyze_site_activity(
                 ad_evidence="Invalid domain"
             )
 
-        exists = norm in clients
+        exists = norm in clients_set
         span.set_attribute("is_existing_client", exists)
         sem = asyncio.Semaphore(5)
         timeout = aiohttp.ClientTimeout(total=10)
-        headers = {'User-Agent': 'Mozilla/5.0'}
 
         html = ''
-        fetch_error = False
         if not exists:
             with tracer.start_as_current_span("fetch_html") as fetch_span:
                 try:
@@ -187,7 +158,6 @@ async def scrape_and_analyze_site_activity(
                     fetch_span.set_attribute("html.length", len(html))
                     fetch_span.set_attribute("activity.status", "success")
                 except Exception as e:
-                    fetch_error = True
                     fetch_span.set_attribute("activity.status", "failed")
                     fetch_span.set_attribute("activity.error", str(e))
         else:
@@ -239,15 +209,6 @@ async def scrape_and_analyze_site_activity(
 
 @activity.defn(name="run_zscore_analysis")
 async def run_zscore_analysis_activity(enriched_sites: List[EnrichedSite]) -> Dict:
-    """
-    Performs Z-score anomaly detection on enriched site data.
-
-    Args:
-        enriched_sites: List of all processed EnrichedSite objects
-
-    Returns:
-        Dict containing analysis results, statistics, and flagged anomalies
-    """
     logger.info(f"Running Z-score analysis on {len(enriched_sites)} sites")
 
     with tracer.start_as_current_span("run_zscore_analysis") as span:
@@ -257,15 +218,13 @@ async def run_zscore_analysis_activity(enriched_sites: List[EnrichedSite]) -> Di
             span.set_attribute("activity.status", "no_data")
             return {"error": "No data to analyze", "flagged_anomalies": []}
 
-        # Convert to DataFrame
         with tracer.start_as_current_span("convert_to_dataframe"):
             df = pl.DataFrame([asdict(site) for site in enriched_sites])
             span.set_attribute("dataframe.rows", df.height)
             span.set_attribute("dataframe.columns", df.width)
 
-        # Filter to sites running ads for analysis
         with tracer.start_as_current_span("filter_ads_sites"):
-            ads_df = df.filter(pl.col("is_running_ads") == True)
+            ads_df = df.filter(pl.col("is_running_ads"))
             span.set_attribute("ads_sites.count", ads_df.height)
 
         if ads_df.height == 0:
@@ -273,7 +232,6 @@ async def run_zscore_analysis_activity(enriched_sites: List[EnrichedSite]) -> Di
             span.set_attribute("activity.status", "no_ads_found")
             return {"total_sites": len(enriched_sites), "ads_sites": 0, "flagged_anomalies": []}
 
-        # Group by run_time_domain to get advertiser-level stats
         with tracer.start_as_current_span("aggregate_advertiser_stats"):
             advertiser_stats = (
                 ads_df.group_by("run_time_domain")
@@ -285,38 +243,37 @@ async def run_zscore_analysis_activity(enriched_sites: List[EnrichedSite]) -> Di
             )
             span.set_attribute("advertisers.count", advertiser_stats.height)
 
-        # Calculate Z-scores
         with tracer.start_as_current_span("calculate_z_scores"):
-            all_stats = advertiser_stats.select([
-                pl.col("run_time_domain"),
-                pl.col("total_ads_sites"),
-                pl.col("total_visitors"),
-                pl.col("avg_visitors"),
-                (pl.col("total_visitors") - pl.mean("total_visitors")).over() / pl.std("total_visitors").over().alias("z_score")
-            ])
+            mean_visitors = advertiser_stats.select(pl.mean("total_visitors")).item()
+            std_visitors = advertiser_stats.select(pl.std("total_visitors")).item()
+            span.set_attribute("mean_visitors", mean_visitors)
+            span.set_attribute("std_visitors", std_visitors or 0)
 
-        # Flag anomalies
+            if std_visitors and std_visitors > 0:
+                all_stats = advertiser_stats.with_columns([
+                    ((pl.col("total_visitors") - mean_visitors) / std_visitors).alias("z_score")
+                ])
+            else:
+                all_stats = advertiser_stats.with_columns([
+                    pl.lit(0.0).alias("z_score")
+                ])
+
         with tracer.start_as_current_span("flag_anomalies"):
-            anomalies = all_stats.filter(abs(pl.col("z_score")) > 1.96)
+            anomalies_df = all_stats.filter(pl.col("z_score").abs() > 1.96)
+            span.set_attribute("advertiser_anomalies.count", anomalies_df.height)
 
-        # Build site-level indicators
         site_indicators = []
-        for row in ads_df.iter_rows(named=True):
-            adv_stat = advertiser_stats.filter(pl.col("run_time_domain") == row["run_time_domain"])
-            if adv_stat.height > 0:
-                total_visitors = adv_stat.select("total_visitors").item()
-                avg_visitors = all_stats.select("avg_visitors").item() if all_stats.height > 0 else 0
-                std_visitors = all_stats.select("total_visitors").std().item()
-                if std_visitors > 0:
-                    z = (row["monthly_visitors"] - avg_visitors) / std_visitors
-                    if abs(z) > 1.96:
-                        site_indicators.append({
-                            "site_domain": row["site_domain"],
-                            "run_time_domain": row["run_time_domain"],
-                            "monthly_visitors": row["monthly_visitors"],
-                            "z_score": round(z, 2),
-                            "status": "FRAUD_CONFIRMED" if z < -1.96 else "REVIEW_REQUIRED"
-                        })
+        if std_visitors and std_visitors > 0:
+            for row in ads_df.iter_rows(named=True):
+                z = (row["monthly_visitors"] - mean_visitors) / std_visitors
+                if abs(z) > 1.96:
+                    site_indicators.append({
+                        "site_domain": row["site_domain"],
+                        "run_time_domain": row["run_time_domain"],
+                        "monthly_visitors": row["monthly_visitors"],
+                        "z_score": round(z, 2),
+                        "status": "FRAUD_CONFIRMED" if z < -1.96 else "REVIEW_REQUIRED"
+                    })
 
         span.set_attribute("anomalies.flagged", len(site_indicators))
         logger.info(f"Z-score analysis complete: {len(site_indicators)} flagged anomalies")
@@ -337,36 +294,20 @@ def generate_report_activity(
     zscore_results: Dict,
     output_path: str = "final_output.csv"
 ) -> Dict:
-    """
-    Generates the final CSV report and summary.
-
-    Args:
-        enriched_sites: All processed site data
-        zscore_results: Results from Z-score analysis
-        output_path: Path to save the CSV output
-
-    Returns:
-        Dict with report metadata and file path
-    """
     logger.info(f"Generating report with {len(enriched_sites)} sites")
 
     with tracer.start_as_current_span("generate_report") as span:
         span.set_attribute("sites.count", len(enriched_sites))
 
-        import polars as pl
-        import os
-
         df = pl.DataFrame([asdict(site) for site in enriched_sites])
         span.set_attribute("dataframe.rows", df.height)
 
-        # Ensure output directory exists
         output_dir = os.path.dirname(output_path) if os.path.dirname(output_path) else "."
         os.makedirs(output_dir, exist_ok=True)
         df.write_csv(output_path, quote_style="always")
 
         span.set_attribute("output.path", output_path)
 
-        # Generate summary statistics
         total_sites = len(enriched_sites)
         sites_with_ads = sum(1 for s in enriched_sites if s.is_running_ads)
         blocked_sites = sum(1 for s in enriched_sites if s.got_blocked)

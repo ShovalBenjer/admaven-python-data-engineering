@@ -11,8 +11,6 @@ from typing import List
 
 from temporalio.client import Client
 from temporalio.worker import Worker
-from temporalio.workflow import start_workflow
-
 # Add src to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 

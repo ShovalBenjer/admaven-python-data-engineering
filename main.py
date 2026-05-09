@@ -11,9 +11,8 @@ import asyncio
 import json
 import os
 import sys
-from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import List, Set
+from typing import List
 import polars as pl
 from temporalio.client import Client
 from temporalio.worker import Worker
@@ -125,8 +124,8 @@ async def main():
         else:
             # Run as client - load data and start workflow
             workdir = os.getenv("WORKDIR", os.getcwd())
-            competitors_csv = os.path.join(workdir, "comp_run_time_domains.csv")
-            clients_csv = os.path.join(workdir, "our_clients.csv")
+            competitors_csv = os.path.join(workdir, "data", "comp_run_time_domains.csv")
+            clients_csv = os.path.join(workdir, "data", "our_clients.csv")
 
             print(f"[main] Loading competitors from {competitors_csv}")
             competitors = load_competitors(competitors_csv)
