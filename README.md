@@ -15,6 +15,8 @@
 
 Two tools for ad-tech: a forensic SQL investigation into network fraud using Z-score anomaly detection, and a concurrent Python scraper for competitive domain intelligence. One catches bot farms. The other maps competitor publisher networks at scale.
 
+**Now also exposing an MCP server** for agentic integration.
+
 ---
 
 ## What It Found
@@ -53,15 +55,63 @@ Pipeline flow: load competitor domains via Polars -> spawn process per competito
 
 ---
 
+## MCP Server Integration
+
+The pipeline is exposed as an MCP (Model Context Protocol) server, enabling LLM agents to invoke fraud detection and scraping tools directly:
+
+```python
+from mcp import Client
+
+# Detect fraud from SQL query
+result = client.call_tool('detect_fraud', {
+    'sql_query': 'SELECT tag_id, advertiser_id, converted_pixel FROM impressions...'
+})
+
+# Scrape competitor websites
+sites = client.call_tool('scrape_competitor', {
+    'domain': 'competitor.com'
+})
+
+# Check HTML for ads
+ad_result = client.call_tool('check_ads', {
+    'html': '<html>...</html>',
+    'use_llm': True
+})
+```
+
+**Tools:**
+- `detect_fraud(sql_query)` — Z-score statistical analysis
+- `scrape_competitor(domain)` — Competitor domain intelligence
+- `check_ads(html)` — Heuristic + LLM ad detection
+
+See `src/mcp_server.py` for implementation.
+
+---
+
 ## Repository Structure
 
 ```
 .
-├── queries_shoval_benjer.sql   # Snowflake SQL fraud logic
-├── python_Shoval_Benjer.py     # Competitive intelligence pipeline
-├── final_output.csv            # Generated dataset
+├── src/
+│   ├── main.py                    # Legacy standalone script
+│   ├── mcp_server.py              # MCP server (new)
+│   ├── lib/
+│   │   ├── fraud_detection.py     # Z-score analysis
+│   │   ├── ad_detection.py        # Heuristic + LLM detection
+│   │   └── scraper.py             # Competitor fetching
+│   ├── queries_shoval_benjer.sql  # Original SQL fraud logic
+│   ├── python_Shoval_Benjer.py    # Original scraper (refactored)
+│   └── requirements.txt
+├── tests/                         # Unit tests
+│   ├── test_heuristic_ad_detect.py
+│   ├── test_fraud_detection.py
+│   ├── test_json_parsing.py
+│   ├── test_scraper.py
+│   └── test_mcp_server.py
+├── pyproject.toml                 # Package metadata & dev deps
+├── .env.example                   # Environment template
+├── final_output.csv               # Generated dataset
 ├── AdMaven_SQL_Investigation_Report.pdf
-├── requirements.txt            # Polars, DuckDB, Loguru
 └── README.md
 ```
 
