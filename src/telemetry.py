@@ -14,10 +14,9 @@ from typing import Optional
 
 _tracer: Optional[trace.Tracer] = None
 _meter: Optional[metrics.Meter] = None
-
-_sites_processed_counter: Optional[metrics.Counter] = None
-_ads_detected_counter: Optional[metrics.Counter] = None
-_anomalies_flagged_counter: Optional[metrics.Counter] = None
+_sites_counter: Optional[metrics.Counter] = None
+_ads_counter: Optional[metrics.Counter] = None
+_anomalies_counter: Optional[metrics.Counter] = None
 _api_calls_counter: Optional[metrics.Counter] = None
 
 
@@ -97,6 +96,7 @@ def _create_standard_metrics() -> None:
     )
 
     _anomalies_flagged_counter = _meter.create_counter(
+    _anomalies_counter = _meter.create_counter(
         name="anomalies_flagged_total",
         description="Total number of anomalies flagged by Z-score",
         unit="1"
