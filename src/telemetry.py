@@ -78,22 +78,24 @@ def setup_telemetry(
 
 def _create_standard_metrics() -> None:
     """Create standard application metrics."""
-    global _sites_counter, _ads_counter, _anomalies_counter, _api_calls_counter
+    global _sites_processed_counter, _ads_detected_counter, _anomalies_flagged_counter, _api_calls_counter
+
     if _meter is None:
         return
 
-    _sites_counter = _meter.create_counter(
+    _sites_processed_counter = _meter.create_counter(
         name="sites_processed_total",
         description="Total number of sites processed",
         unit="1"
     )
 
-    _ads_counter = _meter.create_counter(
+    _ads_detected_counter = _meter.create_counter(
         name="ads_detected_total",
         description="Total number of sites with ads detected",
         unit="1"
     )
 
+    _anomalies_flagged_counter = _meter.create_counter(
     _anomalies_counter = _meter.create_counter(
         name="anomalies_flagged_total",
         description="Total number of anomalies flagged by Z-score",
@@ -133,10 +135,10 @@ def get_meter() -> metrics.Meter:
 def record_site_processed(success: bool = True, has_ads: bool = False) -> None:
     """Record metrics for a processed site."""
     try:
-        if _sites_counter is not None:
-            _sites_counter.add(1, {"success": str(success)})
-        if has_ads and _ads_counter is not None:
-            _ads_counter.add(1)
+        if _sites_processed_counter is not None:
+            _sites_processed_counter.add(1, {"success": str(success)})
+        if has_ads and _ads_detected_counter is not None:
+            _ads_detected_counter.add(1)
     except Exception:
         pass
 
@@ -144,8 +146,8 @@ def record_site_processed(success: bool = True, has_ads: bool = False) -> None:
 def record_anomaly_flagged(status: str) -> None:
     """Record an anomaly being flagged."""
     try:
-        if _anomalies_counter is not None:
-            _anomalies_counter.add(1, {"status": status})
+        if _anomalies_flagged_counter is not None:
+            _anomalies_flagged_counter.add(1, {"status": status})
     except Exception:
         pass
 
