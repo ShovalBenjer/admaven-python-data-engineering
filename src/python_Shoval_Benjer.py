@@ -11,6 +11,7 @@ try:
     from loguru import logger
     import polars as pl
     import duckdb
+    from memory import PatternStore, FraudPattern, EmbeddingGenerator
 except ImportError as e:
     sys.exit(f"Missing dependency: {e}")
 load_dotenv()
@@ -138,6 +139,72 @@ def worker_entry(comp: str, dom: str, clients: Set[str]) -> List[EnrichedSite]:
     log = logger.bind(process=comp) 
     return asyncio.run(process_competitor_async(log, comp, dom, clients))
 
+
+MEMORY_ENABLED = os.getenv("AGENTOPS_MEMORY_ENABLED", "false").lower() == "true"
+_memory_store = None
+
+
+def _get_memory_store():
+    global _memory_store
+    if _memory_store is None:
+        _memory_store = PatternStore()
+        _memory_store.connect()
+        _memory_store.initialize_schema()
+    return _memory_store
+
+
+def retrieve_similar_fraud_patterns(
+    description: str,
+    fraud_type: Optional[str] = None,
+    advertiser_id: Optional[str] = None,
+    k: int = 5,
+) -> List[Dict]:
+    if not MEMORY_ENABLED:
+        return []
+    try:
+        store = _get_memory_store()
+        results = store.find_similar_by_description(
+            description, k=k, fraud_type=fraud_type, advertiser_id=advertiser_id,
+        )
+        return results
+    except Exception as e:
+        logger.bind(process="Memory").warning(f"Pattern retrieval failed: {e}")
+        return []
+
+
+def store_fraud_patterns_from_results(results: List[EnrichedSite]) -> None:
+    if not MEMORY_ENABLED:
+        return
+    try:
+        store = _get_memory_store()
+        patterns = []
+        for r in results:
+            if r.got_blocked and not r.already_working:
+                patterns.append(FraudPattern(
+                    advertiser_id=r.competitor_name,
+                    campaign_id=r.run_time_domain,
+                    fraud_type="blocked_scrape",
+                    confidence_score=0.6,
+                    pattern_description=f"Blocked scrape for site {r.site_domain} under competitor {r.competitor_name}. Evidence: {r.ad_evidence}",
+                    metadata={"site_domain": r.site_domain, "scan_date": r.scan_date},
+                ))
+            if r.is_running_ads and not r.already_working:
+                patterns.append(FraudPattern(
+                    advertiser_id=r.competitor_name,
+                    campaign_id=r.run_time_domain,
+                    fraud_type="ad_fraud_suspect",
+                    confidence_score=0.5,
+                    pattern_description=f"Site {r.site_domain} running ads with evidence: {r.ad_evidence}. Competitor: {r.competitor_name}",
+                    metadata={"site_domain": r.site_domain, "monthly_visitors": r.monthly_visitors, "scan_date": r.scan_date},
+                ))
+        if patterns:
+            store.store_patterns(patterns)
+            log = logger.bind(process="Memory")
+            log.info(f"Stored {len(patterns)} fraud patterns from scan results")
+    except Exception as e:
+        logger.bind(process="Memory").warning(f"Pattern storage failed: {e}")
+
+
 def main():
     """Main execution entry point."""
     log = logger.bind(process="Main")
@@ -149,6 +216,19 @@ def main():
         comp_df = pl.read_csv("comp_run_time_domains.csv")
         tasks = list(zip(comp_df["competitor"], comp_df["run_time_domain"]))
     except Exception as e: return log.critical(f"Setup Failed: {e}")
+    if MEMORY_ENABLED:
+        try:
+            store = _get_memory_store()
+            for comp, domain in tasks:
+                similar = store.find_similar_by_description(
+                    f"competitor {comp} domain {domain}",
+                    advertiser_id=comp,
+                    k=3,
+                )
+                if similar:
+                    log.info(f"Found {len(similar)} historical patterns for {comp}: {[s['fraud_type'] for s in similar]}")
+        except Exception as e:
+            log.warning(f"Memory lookup failed: {e}")
     all_res = []
     with ProcessPoolExecutor(max_workers=os.cpu_count() or 4) as exc:
         futures = {exc.submit(worker_entry, c, d, clients): c for c, d in tasks}
@@ -156,6 +236,7 @@ def main():
             try: all_res.extend(f.result())
             except Exception as e: log.error(f"Crash: {e}")
     if all_res:
+        store_fraud_patterns_from_results(all_res)
         pl.DataFrame([asdict(x) for x in all_res]).write_csv("final_output.csv", quote_style="always")
         log.success("Done")
 if __name__ == "__main__": main()
