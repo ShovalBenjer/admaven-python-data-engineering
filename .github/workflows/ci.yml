@@ -1,0 +1,29 @@
+name: ci
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install tooling
+        run: pip install ruff pytest
+      - name: Lint
+        run: |
+          if [ -f pyproject.toml ] || [ -f ruff.toml ] || [ -f .ruff.toml ]; then
+            ruff check .
+          else
+            ruff check --select E9,F . || true
+          fi
+      - name: Test
+        run: |
+          if ls tests/test_*.py test_*.py 2>/dev/null | head -1 | grep -q .; then
+            pytest -q
+          else
+            echo "no tests found, skipping"
+          fi
