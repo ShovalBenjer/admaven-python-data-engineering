@@ -1,0 +1,3 @@
+# jev/decisions.jsonl: append-only local routing telemetry (ADR-0009).
+# Every routing decision is logged here; machine-generated, never committed.
+jev/decisions.jsonl
