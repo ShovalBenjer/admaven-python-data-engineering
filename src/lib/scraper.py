@@ -13,6 +13,7 @@ from dataclasses import dataclass, asdict
 import aiohttp
 from loguru import logger
 from .ad_detection import check_ads
+from .provenance import TrustTier, tag
 
 # Configurable API endpoint
 SIMILAR_SITES_API_URL = os.getenv(
@@ -35,6 +36,10 @@ class EnrichedSite:
     already_working: bool
     is_running_ads: bool
     ad_evidence: str
+    # Provenance: where this record's bytes came from + how much we trust it.
+    # trust_tier defaults to the lowest tier (fail closed: unknown == untrusted).
+    source_id: str = ""
+    trust_tier: str = "scraped-web"
 
 
 def normalize_domain(domain: str) -> str:
@@ -165,17 +170,32 @@ async def process_site(
             ),
         }
     
-    return EnrichedSite(
-        scan_date=date.today().isoformat(),
-        site_domain=norm,
-        competitor_name=competitor_name,
-        run_time_domain=run_domain,
-        monthly_visitors=monthly_visitors,
-        contacts_json=json.dumps(contacts, ensure_ascii=False),
-        got_blocked=not html and not exists,
-        already_working=exists,
-        is_running_ads=is_ads,
-        ad_evidence=evidence,
+    # Provenance: the tier is the lowest-trust input that shaped this record.
+    if html:
+        # Raw third-party HTML was fetched and fed to the LLM ad detector.
+        source_id, tier = f"http://{norm}", TrustTier.SCRAPED_WEB
+    elif exists:
+        # No fetch performed; the domain came from the operator's client list.
+        source_id, tier = "clients.csv", TrustTier.USER_SUPPLIED
+    else:
+        # Unreachable/blocked: only the AdMaven API named this domain.
+        source_id, tier = SIMILAR_SITES_API_URL, TrustTier.INTERNAL_API
+
+    return tag(
+        EnrichedSite(
+            scan_date=date.today().isoformat(),
+            site_domain=norm,
+            competitor_name=competitor_name,
+            run_time_domain=run_domain,
+            monthly_visitors=monthly_visitors,
+            contacts_json=json.dumps(contacts, ensure_ascii=False),
+            got_blocked=not html and not exists,
+            already_working=exists,
+            is_running_ads=is_ads,
+            ad_evidence=evidence,
+        ),
+        source_id=source_id,
+        trust_tier=tier,
     )
 
 
